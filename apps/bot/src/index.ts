@@ -1294,6 +1294,39 @@ app.get("/api/me/creator-earnings", telegramAuth, async (_req: Request, res: Res
 });
 
 // Audit fix #6: wallet transaction history for the monetization screen.
+// Audit fix #16: Mini App post composer publishes through the API (instant publish,
+// same fields the bot flow writes) so in-app posting works without the bot round-trip.
+app.post("/api/posts", telegramAuth, async (req: Request, res: Response) => {
+  const user = res.locals.telegramUser;
+  const title = typeof req.body?.title === "string" ? req.body.title.normalize("NFKC").trim().slice(0, 100) : "";
+  const body = typeof req.body?.body === "string" ? req.body.body.normalize("NFKC").trim().slice(0, 6000) : "";
+  const category = typeof req.body?.category === "string" && req.body.category.trim() ? req.body.category.trim().slice(0, 40) : "community";
+  const tags = Array.isArray(req.body?.tags) ? (req.body.tags as unknown[]).map(x => String(x).normalize("NFKC").trim()).filter(Boolean).slice(0, 8) : [];
+  if (!title || !body) return res.status(400).json({ success: false, data: null, error: "ርዕስ እና ይዘት ያስፈልጋል።", timestamp: new Date().toISOString() });
+  const safety = await enforceContentModeration(user.id, STAFF_ROLES.includes(user.role), [title, body, ...tags]);
+  if (!safety.ok) return res.status(safety.status).json({ success: false, data: null, error: safety.error, timestamp: new Date().toISOString() });
+  const excerpt = body.slice(0, 180).replace(/\s+\S*$/, "").trim();
+  const readingMinutes = Math.max(1, Math.ceil(body.split(/\s+/).filter(Boolean).length / 180));
+  const baseSlug = title.toLowerCase().replace(/[^\p{L}\p{N}\s-]/gu, "").replace(/\s+/g, "-").replace(/-+/g, "-").slice(0, 60) || `genzi-${Date.now()}`;
+  const post = await db.post.create({ data: { slug: `${baseSlug}-${randomBytes(3).toString("hex")}`, title, body, excerpt, category, tagsJson: JSON.stringify(tags), authorName: user.firstName ?? "GENZI", readingMinutes, publishedAt: new Date(), authorId: user.id } });
+  await awardXp(user.id, "POST_PUBLISH");
+  res.json({ success: true, data: { ...post, purchased: true }, error: null, timestamp: new Date().toISOString() });
+});
+
+// Audit fix #11: the current user's own published posts (profile hub).
+app.get("/api/me/posts", telegramAuth, async (req: Request, res: Response) => {
+  const userId = res.locals.telegramUser.id;
+  const page = Math.max(1, Number.parseInt(String(req.query.page ?? "1"), 10) || 1);
+  const limit = Math.min(20, Math.max(1, Number.parseInt(String(req.query.limit ?? "10"), 10) || 10));
+  const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  const where = { authorId: userId, publishedAt: { not: null }, ...(q ? { OR: [{ title: { contains: q } }, { body: { contains: q } }] } : {}) };
+  const [items, total] = await Promise.all([
+    db.post.findMany({ where, orderBy: { publishedAt: "desc" }, skip: (page - 1) * limit, take: limit }),
+    db.post.count({ where })
+  ]);
+  res.json({ success: true, data: { items, page, limit, total, hasMore: page * limit < total }, error: null, timestamp: new Date().toISOString() });
+});
+
 app.get("/api/me/wallet/transactions", telegramAuth, async (req: Request, res: Response) => {
   const userId = res.locals.telegramUser.id;
   const limit = Math.min(50, Math.max(1, Number.parseInt(String(req.query.limit ?? "25"), 10) || 25));
