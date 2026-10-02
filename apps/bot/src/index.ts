@@ -10,6 +10,7 @@ import { registerConfessionFlow } from "./confession-flow.js";
 import { registerAdmin } from "./moderation-admin.js";
 import { registerGroupModeration } from "./group-moderation.js";
 import { telegramAuth, adminAuth, moderatorSessionAuth, createModeratorSession, consumeModeratorLoginCode } from "./api-auth.js";
+import { validateTelegramInitData } from "./telegram-webapp.js";
 import { performModerationAction, type AdminDecision } from "./admin-actions.js";
 import { rateLimit, moderateRequestText, collectTextValues, enforceContentModeration } from "./safety.js";
 import { randomBytes } from "node:crypto";
@@ -162,6 +163,58 @@ const realtimeSubscribers = new Map<string, Set<(event: Record<string, unknown>)
 const realtimeTokens = new Map<string, { userId: string; expiresAt: number }>();
 const presence = new Map<string, number>();
 
+// Short-lived signed media URLs. Browser <img>/<video> tags cannot send the
+// X-Telegram-Init-Data header, so authenticated media is delivered through a
+// one-time tokenized URL instead (docs/MONETIZATION & audit fix #1).
+const MEDIA_TOKEN_TTL_MS = 5 * 60_000;
+const mediaTokens = new Map<string, { fileId: string; userId: string; expiresAt: number }>();
+const STAFF_ROLES = ["OWNER", "MODERATOR"];
+
+function createMediaToken(fileId: string, userId: string): string {
+  const token = randomBytes(24).toString("base64url");
+  mediaTokens.set(token, { fileId, userId, expiresAt: Date.now() + MEDIA_TOKEN_TTL_MS });
+  return token;
+}
+
+function consumeMediaToken(token: string): { fileId: string; userId: string } | null {
+  const entry = mediaTokens.get(token);
+  if (!entry) return null;
+  mediaTokens.delete(token); // single-use
+  if (entry.expiresAt <= Date.now()) return null;
+  return entry;
+}
+
+// Paid posts must not leak their media to non-buyers (audit fix #6/#1 combined).
+async function canViewerSeePostMedia(userId: string | null, fileId: string): Promise<boolean> {
+  if (!userId) return false;
+  const viewer = await db.user.findUnique({ where: { id: userId }, select: { role: true } });
+  if (viewer && STAFF_ROLES.includes(viewer.role)) return true;
+  const post = await db.post.findFirst({ where: { mediaFileId: fileId }, orderBy: { publishedAt: "desc" }, select: { id: true, authorId: true, monetizationType: true } });
+  if (!post || post.monetizationType !== "PAID") return true;
+  if (post.authorId === userId) return true;
+  return !!await db.contentPurchase.findUnique({ where: { postId_buyerId: { postId: post.id, buyerId: userId } } });
+}
+
+async function deliverTelegramFile(fileId: string, res: Response): Promise<void> {
+  const file = await bot.api.getFile(fileId);
+  if (!file.file_path) { res.sendStatus(404); return; }
+  const upstream = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${file.file_path}`);
+  if (!upstream.ok || !upstream.body) { res.sendStatus(404); return; }
+  res.setHeader("Cache-Control", "no-store");
+  const contentType = upstream.headers.get("content-type");
+  if (contentType) res.setHeader("Content-Type", contentType);
+  const length = upstream.headers.get("content-length");
+  if (length) res.setHeader("Content-Length", length);
+  const reader = upstream.body.getReader();
+  const pump = async (): Promise<void> => {
+    const { done, value } = await reader.read();
+    if (done) { res.end(); return; }
+    res.write(Buffer.from(value));
+    await pump();
+  };
+  await pump();
+}
+
 function publishRealtime(userId: string, event: Record<string, unknown>): void {
   const listeners = realtimeSubscribers.get(userId);
   if (!listeners) return;
@@ -178,6 +231,7 @@ function pruneRealtimeState(): void {
   const now = Date.now();
   for (const [token, value] of realtimeTokens) if (value.expiresAt <= now) realtimeTokens.delete(token);
   for (const [userId, lastSeen] of presence) if (lastSeen + 90_000 <= now) presence.delete(userId);
+  for (const [token, value] of mediaTokens) if (value.expiresAt <= now) mediaTokens.delete(token);
 }
 setInterval(pruneRealtimeState, 30_000).unref();
 
@@ -266,6 +320,36 @@ app.get("/api/admin/diagnostics", adminAuth, async (_req: Request, res: Response
   }
 });
 
+// Paid content is only ever exposed to buyers, the author, or staff (audit fix #6).
+function hidePaidPostBody<T extends { monetizationType: string; priceCoins: number; authorId: string }>(post: T, viewerId: string | null, viewerRole: string | null): T {
+  if (post.monetizationType !== "PAID") return post;
+  if (viewerId && (viewerId === post.authorId || (viewerRole && STAFF_ROLES.includes(viewerRole)))) return post;
+  return { ...post, body: "", excerpt: "" };
+}
+
+async function listPublishedPosts(where: Record<string, unknown>, viewer: { id: string; role: string } | null, page: number, limit: number) {
+  const [posts, total, purchases] = await Promise.all([
+    db.post.findMany({ where, orderBy: { publishedAt: "desc" }, skip: (page - 1) * limit, take: limit }),
+    db.post.count({ where }),
+    viewer ? db.contentPurchase.findMany({ where: { buyerId: viewer.id }, select: { postId: true } }) : Promise.resolve([] as Array<{ postId: string }>)
+  ]);
+  const bought = new Set(purchases.map(p => p.postId));
+  return { posts: posts.map(p => ({ ...hidePaidPostBody(p, viewer?.id ?? null, viewer?.role ?? null), purchased: bought.has(p.id) || (p.monetizationType !== "PAID") })), total };
+}
+
+// Best-effort viewer resolution for public endpoints: if a valid Telegram WebApp
+// session header is present we identify the user (needed for paid-content gating);
+// anonymous visitors simply get the locked view.
+async function resolveOptionalViewer(req: Request): Promise<{ id: string; role: string } | null> {
+  const initData = req.header("X-Telegram-Init-Data") ?? "";
+  if (!initData) return null;
+  const tgUser = validateTelegramInitData(initData);
+  if (!tgUser) return null;
+  const user = await db.user.findUnique({ where: { telegramId: String(tgUser.id) }, select: { id: true, role: true, blocked: true } });
+  if (!user || user.blocked) return null;
+  return { id: user.id, role: user.role };
+}
+
 app.get("/api/posts", async (req: Request, res: Response) => {
   const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
   const category = typeof req.query.category === "string" ? req.query.category : "";
@@ -276,17 +360,18 @@ app.get("/api/posts", async (req: Request, res: Response) => {
     ...(category ? { category } : {}),
     ...(q ? { OR: [{ title: { contains: q } }, { body: { contains: q } }, { tagsJson: { contains: q } }] } : {})
   };
-  const [posts, total] = await Promise.all([
-    db.post.findMany({ where, orderBy: { publishedAt: "desc" }, skip: (page - 1) * limit, take: limit }),
-    db.post.count({ where })
-  ]);
+  const viewer = await resolveOptionalViewer(req);
+  const { posts, total } = await listPublishedPosts(where, viewer, page, limit);
   res.json({ success: true, data: { items: posts, page, limit, total, hasMore: page * limit < total }, error: null, timestamp: new Date().toISOString() });
 });
 
 app.get("/api/posts/:id", async (req: Request, res: Response) => {
   const post = await db.post.findUnique({ where: { id: String(req.params.id) } });
   if (!post || !post.publishedAt) return res.status(404).json({ success: false, data: null, error: "Post not found", timestamp: new Date().toISOString() });
-  res.json({ success: true, data: post, error: null, timestamp: new Date().toISOString() });
+  const viewer = await resolveOptionalViewer(req);
+  let purchased = post.monetizationType !== "PAID";
+  if (!purchased && viewer) purchased = await db.contentPurchase.findUnique({ where: { postId_buyerId: { postId: post.id, buyerId: viewer.id } } }) !== null;
+  res.json({ success: true, data: { ...hidePaidPostBody(post, viewer?.id ?? null, viewer?.role ?? null), purchased }, error: null, timestamp: new Date().toISOString() });
 });
 
 app.get("/api/me", telegramAuth, async (_req: Request, res: Response) => { const user = res.locals.telegramUser; res.json({ success: true, data: { id: user.id, telegramId: user.telegramId, firstName: user.firstName, username: user.username, role: user.role, locale: user.locale }, error: null, timestamp: new Date().toISOString() }); });
@@ -369,7 +454,8 @@ app.post("/api/posts/:id/view", telegramAuth, async (req: Request, res: Response
 });
 
 app.get("/api/me/feed", telegramAuth, async (req: Request, res: Response) => {
-  const userId = res.locals.telegramUser.id;
+  const viewer = res.locals.telegramUser;
+  const userId = viewer.id;
   const mode = req.query.mode === "following" || req.query.mode === "trending" ? String(req.query.mode) : "for-you";
   const page = Math.max(1, Number.parseInt(String(req.query.page ?? "1"), 10) || 1);
   const limit = Math.min(30, Math.max(1, Number.parseInt(String(req.query.limit ?? "20"), 10) || 20));
@@ -380,16 +466,13 @@ app.get("/api/me/feed", telegramAuth, async (req: Request, res: Response) => {
     const ids = follows.map(x => x.followingId);
     if (!ids.length) return res.json({ success: true, data: { items: [], page, limit, total: 0, hasMore: false, mode }, error: null, timestamp: new Date().toISOString() });
     const where = { publishedAt: { not: null }, authorId: { in: ids } };
-    const [items, total] = await Promise.all([
-      db.post.findMany({ where, orderBy: { publishedAt: "desc" }, skip, take: limit }),
-      db.post.count({ where })
-    ]);
-    return res.json({ success: true, data: { items, page, limit, total, hasMore: page * limit < total, mode }, error: null, timestamp: new Date().toISOString() });
+    const { posts, total } = await listPublishedPosts(where, viewer, page, limit);
+    return res.json({ success: true, data: { items: posts, page, limit, total, hasMore: page * limit < total, mode }, error: null, timestamp: new Date().toISOString() });
   }
 
   if (mode === "trending") {
     const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const [posts, views, reactions, comments] = await Promise.all([
+    const [allPosts, views, reactions, comments] = await Promise.all([
       db.post.findMany({ where: { publishedAt: { not: null } }, orderBy: { publishedAt: "desc" }, take: 200 }),
       db.feedEvent.findMany({ where: { event: "VIEW", createdAt: { gte: since } }, select: { postId: true } }),
       db.postReaction.findMany({ where: { createdAt: { gte: since } }, select: { postId: true } }),
@@ -399,8 +482,8 @@ app.get("/api/me/feed", telegramAuth, async (req: Request, res: Response) => {
     for (const e of views) score.set(e.postId, (score.get(e.postId) ?? 0) + 1);
     for (const e of reactions) score.set(e.postId, (score.get(e.postId) ?? 0) + 3);
     for (const e of comments) score.set(e.postId, (score.get(e.postId) ?? 0) + 4);
-    posts.sort((a, b) => (score.get(b.id) ?? 0) - (score.get(a.id) ?? 0) || (b.publishedAt?.getTime() ?? 0) - (a.publishedAt?.getTime() ?? 0));
-    const total = posts.length, items = posts.slice(skip, skip + limit);
+    allPosts.sort((a, b) => (score.get(b.id) ?? 0) - (score.get(a.id) ?? 0) || (b.publishedAt?.getTime() ?? 0) - (a.publishedAt?.getTime() ?? 0));
+    const total = allPosts.length, items = allPosts.slice(skip, skip + limit);
     return res.json({ success: true, data: { items, page, limit, total, hasMore: page * limit < total, mode }, error: null, timestamp: new Date().toISOString() });
   }
 
@@ -411,7 +494,10 @@ app.get("/api/me/feed", telegramAuth, async (req: Request, res: Response) => {
   const posts = await db.post.findMany({ where: { publishedAt: { not: null } }, orderBy: { publishedAt: "desc" }, take: 200 });
   const rank = (category: string) => { const i = preferred.indexOf(category); return i < 0 ? preferred.length + 5 : i };
   posts.sort((a, b) => rank(a.category) - rank(b.category) || (b.publishedAt?.getTime() ?? 0) - (a.publishedAt?.getTime() ?? 0));
-  const total = posts.length, items = posts.slice(skip, skip + limit);
+  const total = posts.length;
+  const purchasedRows = await db.contentPurchase.findMany({ where: { buyerId: userId }, select: { postId: true } });
+  const purchasedIds = new Set(purchasedRows.map(p => p.postId));
+  const items = posts.slice(skip, skip + limit).map(p => ({ ...hidePaidPostBody(p, userId, viewer.role), purchased: purchasedIds.has(p.id) || p.monetizationType !== "PAID" }));
   res.json({ success: true, data: { items, page, limit, total, hasMore: page * limit < total, preferredCategories: preferred.slice(0, 5), mode }, error: null, timestamp: new Date().toISOString() });
 });
 
@@ -433,6 +519,13 @@ const COMMUNITY_DESC_MAX = 240;
 const COMMUNITY_CATEGORIES = ["ዩኒቨርሲቲ", "ቴክኖሎጂ", "ሙዚቃ", "ጨዋታ", "ስራ", "ንግድ", "ፋሽን", "ከተማ", "ማህበረሰብ"] as const;
 const OPPORTUNITY_TYPES = ["JOB", "GIG", "INTERNSHIP", "SCHOLARSHIP", "TRAINING", "COMPETITION", "BUSINESS", "OTHER"] as const;
 const OPPORTUNITY_CATEGORIES = ["ስራ", "ፍሪላንስ", "ትምህርት", "ስኮላርሺፕ", "ስልጠና", "ውድድር", "ንግድ", "ሌላ"] as const;
+
+// Shared opportunity validation/serialization (used by both user and admin APIs).
+type OpportunityRow = {
+  id: string; title: string; description: string; type: string; category: string;
+  organization: string; location: string | null; deadline: Date | null;
+  contactText: string | null; applicationUrl: string | null; verified: boolean; active: boolean;
+};
 
 app.get("/api/opportunities", telegramAuth, async (req: Request, res: Response) => {
   const q = typeof req.query.q === "string" ? req.query.q.normalize("NFKC").trim() : "";
@@ -562,8 +655,20 @@ app.get("/api/communities/:id/posts", telegramAuth, async (req: Request, res: Re
   const page = Math.max(1, Number.parseInt(String(req.query.page ?? "1"), 10) || 1);
   const limit = Math.min(30, Math.max(1, Number.parseInt(String(req.query.limit ?? "20"), 10) || 20));
   const where = { communityId: String(req.params.id), publishedAt: { not: null } };
-  const [items, total] = await Promise.all([db.post.findMany({ where, orderBy: { publishedAt: "desc" }, skip: (page - 1) * limit, take: limit }), db.post.count({ where })]);
-  res.json({ success: true, data: { items, page, limit, total, hasMore: page * limit < total }, error: null, timestamp: new Date().toISOString() });
+  const viewer = await resolveOptionalViewer(req);
+  const { posts, total } = await listPublishedPosts(where, viewer, page, limit);
+  res.json({ success: true, data: { items: posts, page, limit, total, hasMore: page * limit < total }, error: null, timestamp: new Date().toISOString() });
+});
+
+// Audit fix #8: member list so owners/moderators can manage roles from the Mini App.
+app.get("/api/communities/:id/members", telegramAuth, async (req: Request, res: Response) => {
+  const me = res.locals.telegramUser;
+  const community = await db.community.findUnique({ where: { id: String(req.params.id) }, select: { id: true, ownerId: true } });
+  if (!community) return res.status(404).json({ success: false, data: null, error: "Community not found", timestamp: new Date().toISOString() });
+  const myMembership = await db.communityMember.findUnique({ where: { communityId_userId: { communityId: community.id, userId: me.id } } });
+  if (!myMembership && !STAFF_ROLES.includes(me.role)) return res.status(403).json({ success: false, data: null, error: "ማህበረሰቡን መቀላቀል ያስፈልጋል።", timestamp: new Date().toISOString() });
+  const members = await db.communityMember.findMany({ where: { communityId: community.id }, orderBy: { joinedAt: "asc" }, take: 100, include: { user: { select: { id: true, firstName: true, lastName: true, username: true } } } });
+  res.json({ success: true, data: members.map(m => ({ userId: m.userId, role: m.role, joinedAt: new Date(m.joinedAt), firstName: m.user.firstName, lastName: m.user.lastName, username: m.user.username, isOwner: m.userId === community.ownerId })) , error: null, timestamp: new Date().toISOString() });
 });
 
 app.post("/api/communities/:id/join", telegramAuth, async (req: Request, res: Response) => {
@@ -980,25 +1085,31 @@ app.post("/api/admin/submissions/:id/action", adminAuth, moderatorSessionAuth, a
 });
 
 app.get("/api/media/:fileId", telegramAuth, async (req: Request, res: Response) => {
+  const userId = res.locals.telegramUser.id;
+  if (!await canViewerSeePostMedia(userId, String(req.params.fileId))) return res.sendStatus(403);
   try {
-    const file = await bot.api.getFile(String(req.params.fileId));
-    if (!file.file_path) return res.sendStatus(404);
-    const upstream = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${file.file_path}`);
-    if (!upstream.ok || !upstream.body) return res.sendStatus(404);
-    res.setHeader("Cache-Control", "public, max-age=86400");
-    const contentType = upstream.headers.get("content-type");
-    if (contentType) res.setHeader("Content-Type", contentType);
-    const length = upstream.headers.get("content-length");
-    if (length) res.setHeader("Content-Length", length);
-    const reader = upstream.body.getReader();
-    const pump = async (): Promise<void> => {
-      const { done, value } = await reader.read();
-      if (done) { res.end(); return; }
-      res.write(Buffer.from(value));
-      await pump();
-    };
-    await pump();
+    await deliverTelegramFile(String(req.params.fileId), res);
   } catch (error) { console.error("Media proxy failed", error); res.sendStatus(404); }
+});
+
+// Audit fix #1: <img>/<video> tags cannot attach the X-Telegram-Init-Data header,
+// so the Mini App first requests a short-lived single-use tokenized URL.
+app.get("/api/media/:fileId/signed", telegramAuth, async (req: Request, res: Response) => {
+  const user = res.locals.telegramUser;
+  const fileId = String(req.params.fileId);
+  if (!await canViewerSeePostMedia(user.id, fileId)) return res.status(403).json({ success: false, data: null, error: "Content locked", timestamp: new Date().toISOString() });
+  const token = createMediaToken(fileId, user.id);
+  // The Mini App resolves this relative path against its configured API origin.
+  res.json({ success: true, data: { url: `/api/media-token/${encodeURIComponent(token)}`, expiresInMs: MEDIA_TOKEN_TTL_MS }, error: null, timestamp: new Date().toISOString() });
+});
+
+app.get("/api/media-token/:token", async (req: Request, res: Response) => {
+  const entry = consumeMediaToken(String(req.params.token));
+  if (!entry) return res.status(401).send("Invalid or expired media link");
+  if (!await canViewerSeePostMedia(entry.userId, entry.fileId)) return res.sendStatus(403);
+  try {
+    await deliverTelegramFile(entry.fileId, res);
+  } catch (error) { console.error("Signed media delivery failed", error); res.sendStatus(404); }
 });
 
 app.get("/api/me/growth", telegramAuth, async (_req: Request, res: Response) => {
@@ -1180,6 +1291,21 @@ app.get("/api/me/creator-earnings", telegramAuth, async (_req: Request, res: Res
   const user = res.locals.telegramUser; const wallet = await ensureWallet(user.id);
   const [tips, purchases, subs] = await Promise.all([db.tip.aggregate({ where: { recipientId: user.id }, _sum: { amountCoins: true }, _count: true }), db.contentPurchase.aggregate({ where: { post: { authorId: user.id } }, _sum: { priceCoins: true }, _count: true }), db.creatorSubscription.aggregate({ where: { creatorId: user.id, status: "ACTIVE" }, _sum: { priceCoins: true }, _count: true })]);
   res.json({ success: true, data: { balanceCoins: wallet.balance, tipRevenue: tips._sum.amountCoins ?? 0, tipCount: tips._count, contentRevenue: purchases._sum.priceCoins ?? 0, contentSales: purchases._count, subscriptionRevenue: subs._sum.priceCoins ?? 0, activeSubscribers: subs._count }, error: null, timestamp: new Date().toISOString() });
+});
+
+// Audit fix #6: wallet transaction history for the monetization screen.
+app.get("/api/me/wallet/transactions", telegramAuth, async (req: Request, res: Response) => {
+  const userId = res.locals.telegramUser.id;
+  const limit = Math.min(50, Math.max(1, Number.parseInt(String(req.query.limit ?? "25"), 10) || 25));
+  const items = await db.walletTransaction.findMany({ where: { userId }, orderBy: { createdAt: "desc" }, take: limit, select: { id: true, type: true, amount: true, reference: true, note: true, createdAt: true } });
+  res.json({ success: true, data: items, error: null, timestamp: new Date().toISOString() });
+});
+
+// Audit fix #6: lets the Mini App show Subscribe vs Active on public profiles.
+app.get("/api/users/:id/subscription", telegramAuth, async (req: Request, res: Response) => {
+  const subscriberId = res.locals.telegramUser.id;
+  const sub = await db.creatorSubscription.findUnique({ where: { subscriberId_creatorId: { subscriberId, creatorId: String(req.params.id) } } });
+  res.json({ success: true, data: { active: sub?.status === "ACTIVE", priceCoins: sub?.priceCoins ?? DEFAULT_SUBSCRIPTION_PRICE }, error: null, timestamp: new Date().toISOString() });
 });
 
 function pairIds(a: string, b: string): [string, string] {
