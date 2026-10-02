@@ -1,0 +1,73 @@
+export type Locale = "am" | "en";
+
+const am = {
+  welcome: "🇪🇹 እንኳን ወደ GENZI በደህና መጡ! የኢትዮጵያ ወጣቶች ዲጂታል ማህበረሰብ።",
+  menu: "ከታች ያለውን አማራጭ ይምረጡ።",
+  createPost: "📝 ፖስት ፍጠር",
+  confession: "🔐 ሚስጥራዊ መናዘዣ",
+  poll: "📊 ድምጽ ስጥ",
+  trending: "🔥 አዝማሚያ",
+  opportunities: "🚀 እድሎች",
+  language: "🌐 ቋንቋ",
+  admin: "🛡️ አስተዳደር",
+  cancel: "❌ ሰርዝ",
+  draftSaved: "💾 ረቂቅ ተቀምጧል።",
+  published: "✅ ፖስቱ ታትሟል።",
+  quarantined: "⚠️ ይህ ይዘት ለደህንነት ግምገማ ተይዟል።",
+  rejected: "❌ ይህ ይዘት በGENZI የደህንነት መመሪያ መሠረት አልተቀበለም።",
+  titlePrompt: "1/4 — ርዕስ ያስገቡ።\nከ 100 ፊደላት አይበልጥ።",
+  bodyPrompt: "2/4 — ዋና ጽሑፍ/መግለጫ ያስገቡ።",
+  mediaPrompt: "3/4 — ምስል ወይም ቪዲዮ ይላኩ። መጠኑ በአውቶማቲክ መደበኛ ይደረጋል። ሚዲያ ከሌለ ይህን ደረጃ ይዝለሉ።",
+  categoryPrompt: "4/4 — ምድብ ይምረጡ።",
+  preview: "👀 ቅድመ እይታ",
+  approve: "✅ አጽድቅ እና አትም",
+  edit: "✏️ አርትዕ",
+  saveDraft: "💾 ረቂቅ አስቀምጥ",
+  linkDenied: "🔒 አገናኞችን መጠቀም የሚችሉት ባለቤት ወይም አስተዳዳሪ ብቻ ነው።",
+  forwardedDenied: "🔒 የተላለፈ ይዘት በGENZI ፖስት ስርዓት አይፈቀድም።",
+  confessionIntro: "🔐 መልዕክትዎን አሁን ይላኩ (እስከ 800 ፊደላት)። ማንነትዎ ለህዝብ አይታይም። ለመሰረዝ /cancel ይላኩ።",
+  confessionPreviewLabel: "👀 የመናዘዣ ቅድመ እይታ",
+  confessionConfirmPrompt: "ይህንን በGENZI ቻናል ላይ በማንነት ስውር ሆኖ ማተም ይፈልጋሉ?",
+  confessionYes: "✅ አዎ፣ አትም",
+  confessionNo: "❌ አይ",
+  confessionPublished: "✅ መናዘዣዎ ማንነት ስውር ሆኖ ታትሟል።",
+  confessionCancelled: "❌ መናዘዣው ተሰርዟል።"
+} as const;
+
+const en = {
+  welcome: "🇪🇹 Welcome to GENZI — Ethiopia's Gen Z digital community.",
+  menu: "Choose an option below.",
+  createPost: "📝 Create Post",
+  confession: "🔐 Anonymous Confession",
+  poll: "📊 Polls",
+  trending: "🔥 Trending",
+  opportunities: "🚀 Opportunities",
+  language: "🌐 Language",
+  admin: "🛡️ Admin",
+  cancel: "❌ Cancel",
+  draftSaved: "💾 Draft saved.",
+  published: "✅ Post published.",
+  quarantined: "⚠️ Content has been held for safety review.",
+  rejected: "❌ Content was rejected under GENZI safety rules.",
+  titlePrompt: "1/4 — Enter a title. Maximum 100 characters.",
+  bodyPrompt: "2/4 — Enter the body/caption.",
+  mediaPrompt: "3/4 — Send an image or video. Media is normalized automatically. Send /skip to continue without media.",
+  categoryPrompt: "4/4 — Choose a category.",
+  preview: "👀 Preview",
+  approve: "✅ Approve & Publish",
+  edit: "✏️ Edit",
+  saveDraft: "💾 Save Draft",
+  linkDenied: "🔒 Links are allowed only for the owner or administrators.",
+  forwardedDenied: "🔒 Forwarded content is not allowed in the GENZI post system.",
+  confessionIntro: "🔐 Send your message now (up to 800 characters). Your identity is never shown publicly. Send /cancel to stop.",
+  confessionPreviewLabel: "👀 Confession preview",
+  confessionConfirmPrompt: "Publish this anonymously on the GENZI channel?",
+  confessionYes: "✅ Yes, publish",
+  confessionNo: "❌ No",
+  confessionPublished: "✅ Your confession was published anonymously.",
+  confessionCancelled: "❌ Confession cancelled."
+} as const;
+
+export function t(locale: Locale, key: keyof typeof am): string {
+  return locale === "am" ? am[key] : en[key];
+}
