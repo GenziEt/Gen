@@ -1,0 +1,132 @@
+import { randomBytes, randomInt } from "node:crypto";
+import { validateTelegramInitData } from "./telegram-webapp.js";
+import { env } from "./config.js";
+import { db } from "./db.js";
+export async function telegramAuth(req, res, next) {
+    const initData = req.header("X-Telegram-Init-Data") ?? "";
+    const user = validateTelegramInitData(initData);
+    if (!user)
+        return res.status(401).json({
+            success: false,
+            data: null,
+            error: "Invalid Telegram WebApp session",
+            timestamp: new Date().toISOString(),
+        });
+    const dbUser = await db.user.upsert({
+        where: { telegramId: String(user.id) },
+        update: {
+            ...(user.username !== undefined ? { username: user.username } : {}),
+            ...(user.first_name !== undefined ? { firstName: user.first_name } : {}),
+            ...(user.last_name !== undefined ? { lastName: user.last_name } : {}),
+        },
+        create: {
+            telegramId: String(user.id),
+            ...(user.username !== undefined ? { username: user.username } : {}),
+            ...(user.first_name !== undefined ? { firstName: user.first_name } : {}),
+            ...(user.last_name !== undefined ? { lastName: user.last_name } : {}),
+        },
+    });
+    if (dbUser.blocked)
+        return res.status(403).json({
+            success: false,
+            data: null,
+            error: "የመለያዎ መዳረሻ ታግዷል።",
+            timestamp: new Date().toISOString(),
+        });
+    if (dbUser.restrictedUntil && dbUser.restrictedUntil > new Date())
+        return res.status(403).json({
+            success: false,
+            data: { restrictedUntil: dbUser.restrictedUntil },
+            error: "የመለያዎ ተግባራት ለጊዜው ተገድበዋል።",
+            timestamp: new Date().toISOString(),
+        });
+    res.locals.telegramUser = dbUser;
+    next();
+}
+export function adminAuth(req, res, next) {
+    if (req.header("X-Admin-Key") !== env.ADMIN_API_KEY)
+        return res.status(401).json({
+            success: false,
+            data: null,
+            error: "Unauthorized",
+            timestamp: new Date().toISOString(),
+        });
+    next();
+}
+// --- Moderator identity verification -----------------------------------------------------
+// The shared ADMIN_API_KEY only proves possession of the admin panel's static secret; it says
+// nothing about *which* staff member is acting. Every moderation action needs to be attributed
+// to a specific, verified person, so we layer a second factor on top of adminAuth: a one-time
+// login code that only reaches that person's own Telegram account via the bot (proof of
+// Telegram identity, same trust root as telegramAuth), exchanged here for a short-lived session
+// token. Nothing here is persisted to the database or survives a process restart on purpose —
+// codes and sessions are intentionally short-lived, in-memory, single-purpose credentials.
+const LOGIN_CODE_TTL_MS = 5 * 60 * 1000;
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I
+const pendingCodes = new Map();
+const sessions = new Map();
+setInterval(() => {
+    const now = Date.now();
+    for (const [code, entry] of pendingCodes)
+        if (entry.expiresAt <= now)
+            pendingCodes.delete(code);
+    for (const [token, entry] of sessions)
+        if (entry.expiresAt <= now)
+            sessions.delete(token);
+}, 5 * 60 * 1000).unref();
+function generateCode() {
+    let code = "";
+    for (let i = 0; i < 6; i++)
+        code += CODE_ALPHABET[randomInt(CODE_ALPHABET.length)];
+    return code;
+}
+export function createModeratorLoginCode(userId) {
+    for (const [code, entry] of pendingCodes)
+        if (entry.userId === userId)
+            pendingCodes.delete(code);
+    const code = generateCode();
+    const expiresAt = Date.now() + LOGIN_CODE_TTL_MS;
+    pendingCodes.set(code, { userId, expiresAt });
+    return { code, expiresAt: new Date(expiresAt) };
+}
+export function consumeModeratorLoginCode(rawCode) {
+    const code = rawCode.trim().toUpperCase();
+    const entry = pendingCodes.get(code);
+    pendingCodes.delete(code); // one-time use regardless of outcome
+    if (!entry || entry.expiresAt <= Date.now())
+        return null;
+    return entry.userId;
+}
+export function createModeratorSession(userId) {
+    const token = randomBytes(32).toString("hex");
+    const expiresAt = Date.now() + SESSION_TTL_MS;
+    sessions.set(token, { userId, expiresAt });
+    return { token, expiresAt: new Date(expiresAt) };
+}
+export async function moderatorSessionAuth(req, res, next) {
+    const token = req.header("X-Moderator-Session") ?? "";
+    const entry = sessions.get(token);
+    if (!entry || entry.expiresAt <= Date.now()) {
+        sessions.delete(token);
+        return res.status(401).json({
+            success: false,
+            data: null,
+            error: "Moderator session required or expired. Use /moderatorlogin in the bot and verify in the panel.",
+            timestamp: new Date().toISOString(),
+        });
+    }
+    const moderator = await db.user.findUnique({ where: { id: entry.userId } });
+    if (!moderator ||
+        (moderator.role !== "OWNER" && moderator.role !== "MODERATOR")) {
+        sessions.delete(token);
+        return res.status(403).json({
+            success: false,
+            data: null,
+            error: "Moderator account required",
+            timestamp: new Date().toISOString(),
+        });
+    }
+    res.locals.moderator = moderator;
+    next();
+}
