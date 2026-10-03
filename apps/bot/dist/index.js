@@ -680,6 +680,15 @@ app.get("/api/me/opportunities/saved", telegramAuth, async (req, res) => {
     const rows = await db.opportunitySave.findMany({ where: { userId: res.locals.telegramUser.id }, orderBy: { createdAt: "desc" }, include: { opportunity: { include: { _count: { select: { saves: true } } } } } });
     res.json({ success: true, data: rows.map(x => ({ ...x.opportunity, saved: true })), error: null, timestamp: new Date().toISOString() });
 });
+app.get("/api/admin/opportunities", adminAuth, async (req, res) => {
+    const page = Math.max(1, Number.parseInt(String(req.query.page ?? "1"), 10) || 1);
+    const limit = Math.min(50, Math.max(1, Number.parseInt(String(req.query.limit ?? "30"), 10) || 30));
+    const [items, total] = await Promise.all([
+        db.opportunity.findMany({ orderBy: { createdAt: "desc" }, skip: (page - 1) * limit, take: limit, include: { owner: { select: { id: true, firstName: true, username: true } }, _count: { select: { saves: true } } } }),
+        db.opportunity.count()
+    ]);
+    res.json({ success: true, data: { items, page, limit, total, hasMore: page * limit < total }, error: null, timestamp: new Date().toISOString() });
+});
 app.post("/api/admin/opportunities", adminAuth, async (req, res) => {
     const title = typeof req.body?.title === "string" ? req.body.title.normalize("NFKC").trim().slice(0, 120) : "";
     const description = typeof req.body?.description === "string" ? req.body.description.normalize("NFKC").trim().slice(0, 1200) : "";
