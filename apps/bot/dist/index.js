@@ -109,14 +109,96 @@ bot.callbackQuery(/^lang:(am|en)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     await ctx.reply(locale === "AMHARIC" ? "🇪🇹 ቋንቋው ወደ አማርኛ ተቀይሯል።" : "🇬🇧 Language changed to English.");
 });
+// Telegram-safe HTML escaping for dynamic content rendered into bot messages.
+const escapeHtml = (value) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const OPPORTUNITY_EMOJI = { JOB: "💼", GIG: "🛠️", INTERNSHIP: "🎓", SCHOLARSHIP: "🏫", TRAINING: "📚", COMPETITION: "🏆", BUSINESS: "💡", OTHER: "🚀" };
+// Trending posts — computed live from the same engagement-scored query used by GET /api/me/feed?mode=trending.
+async function sendTrending(ctx, locale) {
+    try {
+        const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const [allPosts, views, reactions, comments] = await Promise.all([
+            db.post.findMany({ where: { publishedAt: { not: null } }, orderBy: { publishedAt: "desc" }, take: 200 }),
+            db.feedEvent.findMany({ where: { event: "VIEW", createdAt: { gte: since } }, select: { postId: true } }),
+            db.postReaction.findMany({ where: { createdAt: { gte: since } }, select: { postId: true } }),
+            db.postComment.findMany({ where: { createdAt: { gte: since }, status: "VISIBLE" }, select: { postId: true } })
+        ]);
+        const score = new Map();
+        for (const e of views)
+            score.set(e.postId, (score.get(e.postId) ?? 0) + 1);
+        for (const e of reactions)
+            score.set(e.postId, (score.get(e.postId) ?? 0) + 3);
+        for (const e of comments)
+            score.set(e.postId, (score.get(e.postId) ?? 0) + 4);
+        allPosts.sort((a, b) => (score.get(b.id) ?? 0) - (score.get(a.id) ?? 0) || (b.publishedAt?.getTime() ?? 0) - (a.publishedAt?.getTime() ?? 0));
+        const top = allPosts.slice(0, 5);
+        if (!top.length) {
+            await ctx.reply(locale === "am" ? "🔥 አዝማሚያ\n\nእስካሁን ሊታወቅ የቻለ ፖስት የለም። ይዘት ሲደርስ እዚህ ይታያል።" : "🔥 Trending\n\nNo trending posts yet. Fresh content will show up here.");
+            return;
+        }
+        const lines = top.map((p, i) => `${i + 1}. <b>${escapeHtml(p.title)}</b>\n✍️ ${escapeHtml(p.authorName)} · 👁 ${score.get(p.id) ?? 0} engagement`);
+        const header = locale === "am" ? "🔥 <b>አዝማሚያ — ባለፉት 7 ቀናት</b>" : "🔥 <b>Trending — last 7 days</b>";
+        const kb = new InlineKeyboard().text(locale === "am" ? "🌐 ሙሉውን ይመልከቱ" : "🌐 View full feed", "webapp:trending");
+        await ctx.reply(`${header}\n\n${lines.join("\n\n")}`, { parse_mode: "HTML", reply_markup: kb });
+    }
+    catch (err) {
+        logger.error("trending handler failed", { error: String(err) });
+        await ctx.reply(locale === "am" ? "🔥 አዝማሚያ መጫን ተስፋ አልቋል፤ እንደገና ይሞክሩ።" : "🔥 Could not load trending right now; please try again.");
+    }
+}
+// Opportunities — latest active, non-expired listings from the Opportunity table (same source as GET /api/opportunities).
+async function sendOpportunities(ctx, locale) {
+    try {
+        const now = new Date();
+        const items = await db.opportunity.findMany({
+            where: { active: true, OR: [{ deadline: null }, { deadline: { gte: now } }] },
+            orderBy: [{ verified: "desc" }, { deadline: "asc" }, { createdAt: "desc" }],
+            take: 8,
+            include: { _count: { select: { saves: true } } }
+        });
+        if (!items.length) {
+            await ctx.reply(locale === "am" ? "🚀 እድሎች\n\nአሁን ላይ ክፍት የሆነ እድል የለም። አዲስ እድል ለመፍጠር Web App ይክፈቱ።" : "🚀 Opportunities\n\nNo open opportunities right now. Open the Web App to post one.");
+            return;
+        }
+        const lines = items.map(o => {
+            const emoji = OPPORTUNITY_EMOJI[o.type] ?? "🚀";
+            const parts = [`${emoji} <b>${escapeHtml(o.title)}</b> — ${escapeHtml(o.organization)}`];
+            if (o.location)
+                parts.push(`📍 ${escapeHtml(o.location)}`);
+            parts.push(o.deadline ? `⏳ Deadline: ${o.deadline.toISOString().slice(0, 10)}` : (locale === "am" ? "⏳ ጊዜ ገደብ የለም" : "⏳ No deadline"));
+            parts.push(`⭐ ${o._count.saves}`);
+            return parts.join("\n");
+        });
+        const header = locale === "am" ? "🚀 <b>እድሎች — ክፍት ዝርዝር</b>" : "🚀 <b>Opportunities — open now</b>";
+        const kb = new InlineKeyboard().text(locale === "am" ? "🌐 ሁሉንም እድሎች ይመልከቱ" : "🌐 View all opportunities", "webapp:opportunities");
+        await ctx.reply(`${header}\n\n${lines.join("\n\n")}`, { parse_mode: "HTML", reply_markup: kb });
+    }
+    catch (err) {
+        logger.error("opportunities handler failed", { error: String(err) });
+        await ctx.reply(locale === "am" ? "🚀 እድሎች መጫን ተስፋ አልቋል፤ እንደገና ይሞክሩ።" : "🚀 Could not load opportunities right now; please try again.");
+    }
+}
 bot.callbackQuery("trending", async (ctx) => {
     await ctx.answerCallbackQuery();
-    await ctx.reply("🔥 አዝማሚያ\n\nይህ ክፍል የGENZI የታወቁ ፖስቶችን በኋላ ከማዕከላዊ feed ጋር ያሳያል።");
+    const tgId = ctx.from ? String(ctx.from.id) : "";
+    const user = tgId ? await db.user.findUnique({ where: { telegramId: tgId }, select: { locale: true } }) : null;
+    await sendTrending(ctx, user?.locale === "ENGLISH" ? "en" : "am");
 });
 bot.callbackQuery("opportunities", async (ctx) => {
     await ctx.answerCallbackQuery();
-    await ctx.reply("🚀 እድሎች\n\n💰 የገንዘብ እድሎች\n🎓 ትምህርት\n💼 ስራ\n🤖 AI እና ቴክ\n🎉 ዝግጅቶች");
+    const tgId = ctx.from ? String(ctx.from.id) : "";
+    const user = tgId ? await db.user.findUnique({ where: { telegramId: tgId }, select: { locale: true } }) : null;
+    await sendOpportunities(ctx, user?.locale === "ENGLISH" ? "en" : "am");
 });
+// Deep-link buttons on trending/opportunity digests: open the GENZI Web App on the matching tab.
+for (const tab of ["trending", "opportunities"]) {
+    bot.callbackQuery(`webapp:${tab}`, async (ctx) => {
+        await ctx.answerCallbackQuery();
+        const url = `${env.WEBAPP_URL.replace(/\/+$/, "")}/#${tab}`;
+        await ctx.reply("🌐 GENZI Web App", {
+            reply_markup: new InlineKeyboard().url(env.TELEGRAM_BOT_USERNAME ? `Open @${env.TELEGRAM_BOT_USERNAME}` : "Open", url)
+        });
+    });
+}
 registerPostFlow(bot);
 registerConfessionFlow(bot);
 registerAdmin(bot);
